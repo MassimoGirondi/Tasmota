@@ -49,9 +49,9 @@ int32_t  current_real_position = 0;
 int32_t  current_pwm_velocity = 0;
 int8_t   savedata_original = 0;
 
-const uint8_t MAX_MODES = 7;
-enum Shutterposition_mode {SHT_UNDEF, SHT_TIME, SHT_TIME_UP_DOWN, SHT_TIME_GARAGE, SHT_COUNTER, SHT_PWM_VALUE, SHT_PWM_TIME,};
-enum Shutterswitch_mode {SHT_SWITCH, SHT_PULSE,};
+const uint8_t MAX_MODES = 8;
+enum Shutterposition_mode {SHT_UNDEF, SHT_TIME, SHT_TIME_UP_DOWN, SHT_TIME_GARAGE, SHT_COUNTER, SHT_PWM_VALUE, SHT_PWM_TIME, SHT_TIME_SHADERS_REVERSE};
+enum Shutterswitch_mode {SHT_SWITCH, SHT_PULSE};
 enum ShutterButtonStates { SHT_NOT_PRESSED, SHT_PRESSED_MULTI, SHT_PRESSED_HOLD, SHT_PRESSED_IMMEDIATE, SHT_PRESSED_EXT_HOLD, SHT_PRESSED_MULTI_SIMULTANEOUS, SHT_PRESSED_HOLD_SIMULTANEOUS, SHT_PRESSED_EXT_HOLD_SIMULTANEOUS,};
 
 const char kShutterCommands[] PROGMEM = D_PRFX_SHUTTER "|"
@@ -293,6 +293,18 @@ void ShutterInit(void)
 
       } else {
         ShutterGlobal.position_mode = Settings->shutter_mode;
+        String mode = "";
+        switch (Settings->shutter_mode)
+        {
+          case SHT_TIME:  mode = "SHT_TIME"; break;
+          case SHT_TIME_UP_DOWN:  mode = "SHT_TIME_UP_DOWN"; break;
+          case SHT_TIME_GARAGE:   mode = "SHT_TIME_GARAGE"; break;
+          case SHT_COUNTER:  mode = "SHT_COUNTER"; break;
+          case SHT_PWM_VALUE:  mode = "SHT_PWM_VALUE"; break;
+          case SHT_PWM_TIME:  mode = "SHT_PWM_TIME"; break;
+          case SHT_TIME_SHADERS_REVERSE:  mode = "SHT_GARAGE_REVERSE"; break;
+        }
+        AddLog(LOG_LEVEL_INFO, PSTR("Shutter Mode is set to %i -> %s"), Settings->shutter_mode, mode.c_str());
       }
 
       // main function for stepper and servos to control velocity and acceleration.
@@ -477,6 +489,7 @@ void ShutterPowerOff(uint8_t i)
   AddLog(LOG_LEVEL_DEBUG, PSTR("SHT: Stop %d. Mode %d, time:%d"), i+1,Shutter[i].switch_mode, Shutter[i].time); // fix log to indicate correct shutter number
   ShutterDecellerateForStop(i);
   uint8_t cur_relay = Settings->shutter_startrelay[i] + (Shutter[i].direction == 1 ? 0 : (uint8_t)(ShutterGlobal.position_mode == SHT_TIME)) ;
+  uint8_t other_relay = Settings->shutter_startrelay[i] + (Shutter[i].direction != 1) ;
   if (Shutter[i].direction !=0) {
     Shutter[i].direction = 0;
   }
@@ -494,15 +507,25 @@ void ShutterPowerOff(uint8_t i)
       }
     break;
     case SHT_PULSE:
-      // we have a momentary switch here. Needs additional pulse on same relay after the end
-      if ((SRC_PULSETIMER == TasmotaGlobal.last_source || SRC_SHUTTER == TasmotaGlobal.last_source || SRC_WEBGUI == TasmotaGlobal.last_source)) {
-        ExecuteCommandPowerShutter(cur_relay, 1, SRC_SHUTTER);
-        // switch off direction relay to make it power less
-        if (((1 << (Settings->shutter_startrelay[i])) & TasmotaGlobal.power)  && Settings->shutter_startrelay[i]+1 != cur_relay) {
-          ExecuteCommandPowerShutter(Settings->shutter_startrelay[i]+1, 0, SRC_SHUTTER);
+      if (ShutterGlobal.position_mode == SHT_TIME_SHADERS_REVERSE)
+      {
+        AddLog(LOG_LEVEL_DEBUG_MORE, PSTR("GARAGE REVERSE! cur_relay is %i, operating on %i"), cur_relay, other_relay);
+        ExecuteCommandPowerShutter(cur_relay, 0, SRC_SHUTTER);
+        ExecuteCommandPowerShutter(other_relay, 1, SRC_SHUTTER);
+
+      }
+      else {
+        // we have a momentary switch here. Needs additional pulse on same relay after the end
+        if ((SRC_PULSETIMER == TasmotaGlobal.last_source || SRC_SHUTTER == TasmotaGlobal.last_source || SRC_WEBGUI == TasmotaGlobal.last_source)) {
+          ExecuteCommandPowerShutter(cur_relay, 1, SRC_SHUTTER);
+          // switch off direction relay to make it power less
+          if (((1 << (Settings->shutter_startrelay[i])) & TasmotaGlobal.power)  && Settings->shutter_startrelay[i]+1 != cur_relay) {
+            ExecuteCommandPowerShutter(Settings->shutter_startrelay[i]+1, 0, SRC_SHUTTER);
+          }
+        } else {
+          TasmotaGlobal.last_source = SRC_SHUTTER;
         }
-      } else {
-        TasmotaGlobal.last_source = SRC_SHUTTER;
+
       }
     break;
   }
@@ -662,6 +685,7 @@ int32_t ShutterCalculatePosition(uint32_t i)
       case SHT_TIME:
       case SHT_TIME_UP_DOWN:
       case SHT_TIME_GARAGE:
+      case SHT_TIME_SHADERS_REVERSE:
         if (Shutter[i].tilt_config[2] > 0) {
           if (Shutter[i].time <= Shutter[i].venetian_delay) {
             Shutter[i].tilt_real_pos = (Shutter[i].tilt_start_pos + ((Shutter[i].direction * (int16_t)Shutter[i].time * (Shutter[i].tilt_config[1]-Shutter[i].tilt_config[0])) / Shutter[i].tilt_config[2]));
@@ -757,6 +781,15 @@ void ShutterRelayChanged(void)
            case 1:
              ShutterStartInit(i, Shutter[i].lastdirection*-1 , Shutter[i].lastdirection == 1 ?  0 : Shutter[i].open_max);
              AddLog(LOG_LEVEL_DEBUG_MORE, PSTR("SHT: Shtr%d Garage. NewTarget %d"), i, Shutter[i].target_position);
+           break;
+           default:
+            Shutter[i].target_position = Shutter[i].real_position;
+         }
+        case SHT_TIME_SHADERS_REVERSE:
+         switch (powerstate_local) {
+           case 1:
+             ShutterStartInit(i, Shutter[i].lastdirection*-1 , Shutter[i].lastdirection == 1 ?  0 : Shutter[i].open_max);
+             AddLog(LOG_LEVEL_DEBUG_MORE, PSTR("SHT: Shtr%d Shaders reverse. NewTarget %d"), i, Shutter[i].target_position);
            break;
            default:
             Shutter[i].target_position = Shutter[i].real_position;
@@ -1198,6 +1231,14 @@ void CmndShutterPosition(void)
                 ExecuteCommandPowerShutter(Settings->shutter_startrelay[index] + (new_shutterdirection == 1 ? 0 : 1), 1, SRC_SHUTTER);
               }
             break;
+            case SHT_TIME_SHADERS_REVERSE:
+              if (!ShutterGlobal.skip_relay_change) {
+                ExecuteCommandPowerShutter(Settings->shutter_startrelay[index] , 0, SRC_SHUTTER);
+                ExecuteCommandPowerShutter(Settings->shutter_startrelay[index] + 1, 0, SRC_SHUTTER);
+                ExecuteCommandPowerShutter(Settings->shutter_startrelay[index] + (new_shutterdirection == 1 ? 1 : 0), Shutter[index].switch_mode == SHT_SWITCH ? 0 : 1, SRC_SHUTTER);
+              }
+            break;
+
             case SHT_TIME_GARAGE:
               if (!ShutterGlobal.skip_relay_change) {
                 if (new_shutterdirection == Shutter[index].lastdirection) {
